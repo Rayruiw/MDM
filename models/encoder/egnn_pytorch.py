@@ -2,6 +2,29 @@ import torch
 from einops import rearrange, repeat
 from torch import nn, einsum, broadcast_tensors
 
+class GaussianRBF(nn.Module):
+    def __init__(self, num_rbfs=16, cutoff=2.0):
+        super().__init__()
+        centers = torch.linspace(0.0, cutoff, num_rbfs)
+        self.register_buffer("centers", centers)
+        self.gamma = 1.0 / (centers[1] - centers[0]).item() ** 2
+
+    def forward(self, d):  # d: [b, i, j, 1]
+        return torch.exp(-self.gamma * (d - self.centers) ** 2)
+
+
+class DistanceGate(nn.Module):
+    def __init__(self, rbf_dim=16, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(rbf_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, rbf):   # [b,i,j,K]
+        return self.net(rbf)  # [b,i,j,1]
 
 # helper functions
 
@@ -152,37 +175,43 @@ class GlobalLinearAttention(nn.Module):
 
 
 # classes
-
 class EGNN(nn.Module):
     def __init__(
-            self,
-            dim,
-            edge_dim=0,
-            m_dim=16,
-            fourier_features=0,
-            num_nearest_neighbors=0,
-            dropout=0.0,
-            init_eps=1e-3,
-            norm_feats=False,
-            norm_coors=False,
-            norm_coors_scale_init=1e-2,
-            update_feats=True,
-            update_coors=True,
-            only_sparse_neighbors=False,
-            valid_radius=float('inf'),
-            m_pool_method='sum',
-            soft_edges=False,
-            coor_weights_clamp_value=None
+        self,
+        dim,
+        edge_dim=0,
+        m_dim=16,
+        fourier_features=0,
+        num_nearest_neighbors=0,
+        dropout=0.0,
+        init_eps=1e-3,
+        norm_feats=False,
+        norm_coors=False,
+        norm_coors_scale_init=1e-2,
+        update_feats=True,
+        update_coors=True,
+        only_sparse_neighbors=False,
+        valid_radius=float('inf'),
+        m_pool_method='sum',
+        soft_edges=False,
+        coor_weights_clamp_value=None
     ):
         super().__init__()
-        assert m_pool_method in {'sum', 'mean'}, 'pool method must be either sum or mean'
-        assert update_feats or update_coors, 'you must update either features, coordinates, or both'
+        assert m_pool_method in {'sum', 'mean'}
+        assert update_feats or update_coors
 
         self.fourier_features = fourier_features
+        self.num_nearest_neighbors = num_nearest_neighbors
+        self.only_sparse_neighbors = only_sparse_neighbors
+        self.valid_radius = valid_radius
+        self.m_pool_method = m_pool_method
+        self.use_soft_attention = soft_edges
+        self.coor_weights_clamp_value = coor_weights_clamp_value
 
         edge_input_dim = (fourier_features * 2) + (dim * 2) + edge_dim + 1
         dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+        # edge message
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_input_dim, edge_input_dim * 2),
             dropout,
@@ -191,15 +220,14 @@ class EGNN(nn.Module):
             SiLU()
         )
 
-        self.edge_gate = nn.Sequential(
-            nn.Linear(m_dim, 1),
-            nn.Sigmoid()
-        ) if soft_edges else None
+        # distance-based soft attention
+        if self.use_soft_attention:
+            cutoff = valid_radius if valid_radius != float('inf') else 2.0
+            self.rbf = GaussianRBF(num_rbfs=16, cutoff=cutoff)
+            self.dist_gate = DistanceGate(rbf_dim=16, hidden=64)
 
         self.node_norm = nn.LayerNorm(dim) if norm_feats else nn.Identity()
         self.coors_norm = CoorsNorm(scale_init=norm_coors_scale_init) if norm_coors else nn.Identity()
-
-        self.m_pool_method = m_pool_method
 
         self.node_mlp = nn.Sequential(
             nn.Linear(dim + m_dim, dim * 2),
@@ -215,38 +243,34 @@ class EGNN(nn.Module):
             nn.Linear(m_dim * 4, 1)
         ) if update_coors else None
 
-        self.num_nearest_neighbors = num_nearest_neighbors
-        self.only_sparse_neighbors = only_sparse_neighbors
-        self.valid_radius = valid_radius
-
-        self.coor_weights_clamp_value = coor_weights_clamp_value
-
         self.init_eps = init_eps
         self.apply(self.init_)
 
     def init_(self, module):
-        if type(module) in {nn.Linear}:
-            # seems to be needed to keep the network from exploding to NaN with greater depths
+        if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=self.init_eps)
 
     def forward(self, feats, coors, edges=None, mask=None, adj_mat=None):
+        """
+        feats: [b, n, d]
+        coors: [b, n, 3]
+        """
         b, n, _ = feats.shape
         device = feats.device
-        fourier_features = self.fourier_features
-        num_nearest = self.num_nearest_neighbors
-        valid_radius = self.valid_radius
-        only_sparse_neighbors = self.only_sparse_neighbors
 
-        # if exists(mask):
-        #     num_nodes = mask.sum(dim=-1)
-
-        use_nearest = num_nearest > 0 or only_sparse_neighbors
-
+        # pairwise relative coords & distance
         rel_coors = rearrange(coors, 'b i d -> b i () d') - rearrange(coors, 'b j d -> b () j d')
-        rel_dist = (rel_coors ** 2).sum(dim=-1, keepdim=True)
+        rel_dist = (rel_coors ** 2).sum(dim=-1, keepdim=True)  # [b,i,j,1]
 
-        # i = j = n
+        # soft attention from distance (before trimming)
+        if self.use_soft_attention:
+            rbf = self.rbf(rel_dist)            # [b,i,j,K]
+            alpha = self.dist_gate(rbf)         # [b,i,j,1]
+        else:
+            alpha = None
 
+        # nearest neighbors / sparse graph
+        use_nearest = self.num_nearest_neighbors > 0 or self.only_sparse_neighbors
         if use_nearest:
             ranking = rel_dist[..., 0].clone()
 
@@ -256,55 +280,51 @@ class EGNN(nn.Module):
 
             if exists(adj_mat):
                 if len(adj_mat.shape) == 2:
-                    adj_mat = repeat(adj_mat.clone(), 'i j -> b i j', b=b)
+                    adj_mat = repeat(adj_mat, 'i j -> b i j', b=b)
 
-                if only_sparse_neighbors:
-                    num_nearest = int(adj_mat.float().sum(dim=-1).max().item())
-                    valid_radius = 0
+                if self.only_sparse_neighbors:
+                    self.num_nearest_neighbors = int(adj_mat.float().sum(dim=-1).max().item())
+                    self.valid_radius = 0
 
                 self_mask = rearrange(torch.eye(n, device=device, dtype=torch.bool), 'i j -> () i j')
-
                 adj_mat = adj_mat.masked_fill(self_mask, False)
                 ranking.masked_fill_(self_mask, -1.)
                 ranking.masked_fill_(adj_mat, 0.)
 
-            nbhd_ranking, nbhd_indices = ranking.topk(num_nearest, dim=-1, largest=False)
-
-            nbhd_mask = nbhd_ranking <= valid_radius
+            nbhd_ranking, nbhd_indices = ranking.topk(self.num_nearest_neighbors, dim=-1, largest=False)
+            nbhd_mask = nbhd_ranking <= self.valid_radius
 
             rel_coors = batched_index_select(rel_coors, nbhd_indices, dim=2)
             rel_dist = batched_index_select(rel_dist, nbhd_indices, dim=2)
 
+            if self.use_soft_attention:
+                alpha = batched_index_select(alpha, nbhd_indices, dim=2)
+
             if exists(edges):
                 edges = batched_index_select(edges, nbhd_indices, dim=2)
 
-            # j = num_nearest
-
-        if fourier_features > 0:
-            rel_dist = fourier_encode_dist(rel_dist, num_encodings=fourier_features)
+        # optional Fourier encoding
+        if self.fourier_features > 0:
+            rel_dist = fourier_encode_dist(rel_dist, num_encodings=self.fourier_features)
             rel_dist = rearrange(rel_dist, 'b i j () d -> b i j d')
 
-        if use_nearest:
-            feats_j = batched_index_select(feats, nbhd_indices, dim=1)
-        else:
-            feats_j = rearrange(feats, 'b j d -> b () j d')
-
+        # gather node features
         feats_i = rearrange(feats, 'b i d -> b i () d')
+        feats_j = batched_index_select(feats, nbhd_indices, dim=1) if use_nearest else rearrange(feats, 'b j d -> b () j d')
         feats_i, feats_j = broadcast_tensors(feats_i, feats_j)
 
         edge_input = torch.cat((feats_i, feats_j, rel_dist), dim=-1)
-
         if exists(edges):
             edge_input = torch.cat((edge_input, edges), dim=-1)
 
+        # message
         m_ij = self.edge_mlp(edge_input)
+        if self.use_soft_attention:
+            m_ij = m_ij * alpha
 
-        if exists(self.edge_gate):
-            m_ij = m_ij * self.edge_gate(m_ij)
-
+        # build mask
         if exists(mask):
             mask_i = rearrange(mask, 'b i -> b i ()')
-
             if use_nearest:
                 mask_j = batched_index_select(mask, nbhd_indices, dim=1)
                 mask = (mask_i * mask_j) & nbhd_mask
@@ -312,42 +332,41 @@ class EGNN(nn.Module):
                 mask_j = rearrange(mask, 'b j -> b () j')
                 mask = mask_i * mask_j
 
+            if self.use_soft_attention:
+                alpha = alpha.masked_fill(~mask.unsqueeze(-1), 0.)
+
+        # coordinate update
         if exists(self.coors_mlp):
             coor_weights = self.coors_mlp(m_ij)
-            coor_weights = rearrange(coor_weights, 'b i j () -> b i j')
+            if self.use_soft_attention:
+                coor_weights = coor_weights * alpha
 
+            coor_weights = rearrange(coor_weights, 'b i j () -> b i j')
             rel_coors = self.coors_norm(rel_coors)
 
             if exists(mask):
                 coor_weights.masked_fill_(~mask, 0.)
 
             if exists(self.coor_weights_clamp_value):
-                clamp_value = self.coor_weights_clamp_value
-                coor_weights.clamp_(min=-clamp_value, max=clamp_value)
+                v = self.coor_weights_clamp_value
+                coor_weights.clamp_(min=-v, max=v)
 
             coors_out = einsum('b i j, b i j c -> b i c', coor_weights, rel_coors) + coors
         else:
             coors_out = coors
 
+        # node update
         if exists(self.node_mlp):
             if exists(mask):
-                m_ij_mask = rearrange(mask, '... -> ... ()')
-                m_ij = m_ij.masked_fill(~m_ij_mask, 0.)
+                m_ij = m_ij.masked_fill(~mask.unsqueeze(-1), 0.)
 
             if self.m_pool_method == 'mean':
-                if exists(mask):
-                    # masked mean
-                    mask_sum = m_ij_mask.sum(dim=-2)
-                    m_i = safe_div(m_ij.sum(dim=-2), mask_sum)
-                else:
-                    m_i = m_ij.mean(dim=-2)
-
-            elif self.m_pool_method == 'sum':
+                m_i = safe_div(m_ij.sum(dim=-2), mask.unsqueeze(-1).sum(dim=-2)) if exists(mask) else m_ij.mean(dim=-2)
+            else:
                 m_i = m_ij.sum(dim=-2)
 
-            normed_feats = self.node_norm(feats)
-            node_mlp_input = torch.cat((normed_feats, m_i), dim=-1)
-            node_out = self.node_mlp(node_mlp_input) + feats
+            node_input = torch.cat((self.node_norm(feats), m_i), dim=-1)
+            node_out = self.node_mlp(node_input) + feats
         else:
             node_out = feats
 

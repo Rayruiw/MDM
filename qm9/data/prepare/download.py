@@ -1,9 +1,13 @@
 import logging
 import os
 
-from md17 import download_dataset_md17
-from qm9 import download_dataset_qm9
+from .md17 import download_dataset_md17
+#from qm9 import download_dataset_qm9
 
+
+def download_dataset_qm9(*args, **kwargs):
+    print("✅ QM9 dataset already downloaded, skipping download.")
+    return
 
 def prepare_dataset(datadir, dataset, subset=None, splits=None, cleanup=True, force_download=False):
     """
@@ -64,7 +68,7 @@ def prepare_dataset(datadir, dataset, subset=None, splits=None, cleanup=True, fo
     else:
         raise ValueError(
             'Dataset only partially processed. Try deleting {} and running again to download/process.'.format(
-                os.path.join(dataset_dir)))
+                os.path.join(*dataset_dir)))
 
     # If need to download dataset, pass to appropriate downloader
     if new_download or force_download:

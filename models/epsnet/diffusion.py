@@ -1,8 +1,6 @@
 import math
-
 import numpy as np
 import torch
-
 
 def get_timestep_embedding(timesteps, embedding_dim):
     """
@@ -24,11 +22,9 @@ def get_timestep_embedding(timesteps, embedding_dim):
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
     return emb
 
-
 def nonlinearity(x):
     # swish
     return x * torch.sigmoid(x)
-
 
 def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
     def sigmoid(x):
@@ -57,6 +53,8 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
     elif beta_schedule == "sigmoid":
         betas = np.linspace(-6, 6, num_diffusion_timesteps)
         betas = sigmoid(betas) * (beta_end - beta_start) + beta_start
+        # 新增：限制beta范围，避免超出0~0.999（防止扩散过程奇异）
+        betas = np.clip(betas, 0.0, 0.999)  # 仅加这一行！
     elif beta_schedule == "cosine":
         return betas_for_alpha_bar(
             num_diffusion_timesteps,
@@ -66,7 +64,6 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         raise NotImplementedError(beta_schedule)
     assert betas.shape == (num_diffusion_timesteps,)
     return betas
-
 
 def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     """

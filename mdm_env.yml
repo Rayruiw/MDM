@@ -1,0 +1,36 @@
+name: mdm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pytorch
+  - pytorch-cuda=12.1
+  - rdkit
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - tqdm
+  - matplotlib
+  - ipython
+  - jupyter
+  - ase
+  - biopython
+  - h5py
+  - filelock
+  - click
+  - pip:
+      - einops==0.4.1
+      - fair-esm==0.5.0
+      - torch-geometric
+      - torch-scatter
+      - torch-sparse
+      - torch-cluster
+      - torch-spline-conv
+      - msgpack
+      - humanize
+      - huggingface-hub

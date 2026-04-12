@@ -10,7 +10,8 @@ from qm9.data import collate as qm9_collate
 
 
 def extract_conformers(args):
-    drugs_file = os.path.join(args.data_dir, args.data_file)
+    #drugs_file = os.path.join(args.data_dir, args.data_file)
+    drugs_file = "./data/geom/drugs_crude.msgpack"
     save_file = f"geom_drugs_{'no_h_' if args.remove_h else ''}{args.conformations}"
     smiles_list_file = 'geom_drugs_smiles.txt'
     number_atoms_file = f"geom_drugs_n_{'no_h_' if args.remove_h else ''}{args.conformations}"

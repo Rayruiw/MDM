@@ -1,0 +1,89 @@
+model:
+  type: diffusion
+  network: MDMFullDP
+  hidden_dim: 256
+  num_convs: 4
+  num_convs_local: 3
+  cutoff: 10.0
+  mlp_act: silu
+  n_rbf: 40
+  beta_schedule: sigmoid
+  beta_start: 1.e-6
+  beta_end: 1.e-3
+  num_diffusion_timesteps: 1000
+  edge_order: 3
+  edge_encoder: mlp
+  smooth_conv: false
+  num_layer: 6
+  feats_dim: 5
+  soft_edge: True
+  norm_coors: True
+  m_dim: 128
+  context: None
+  vae_context: False
+  num_atom: 6
+
+  use_edge_weighting: true
+  local_graph_type: bond
+  predict_local_pos: true
+  use_zero_init: true
+  local_radius_cutoff: 2.2
+  local_pos_weight: 1.0
+
+  w_scheme: cosine
+  w_r0: 2.0
+  w_r1: 10.0
+  w_min: 1.e-4
+
+  lambda_global_pos: 1.0
+  lambda_local_pos: 1.0
+  lambda_global_node: 0.3
+  lambda_local_node: 0.3
+
+  use_geometry: false
+  lambda_local_dist: 0.0
+  lambda_bond_dist: 0.0
+  lambda_global_dist: 0.0
+  lambda_repulsion: 0.0
+  geom_a_threshold: 0.25
+
+train:
+  seed: 2021
+  batch_size: 128
+  val_freq: 50
+  max_iters: 1000
+  max_grad_norm: 1.0
+  num_workers: 4
+  anneal_power: 2.0
+  optimizer:
+    type: adam
+    lr: 5.e-5
+    weight_decay: 0.000001
+    beta1: 0.95
+    beta2: 0.999
+  scheduler:
+    type: plateau
+    factor: 0.8
+    patience: 30
+    min_lr: 1.e-6
+  transform:
+    mask:
+      type: mixed
+      min_ratio: 0.0
+      max_ratio: 1.2
+      min_num_masked: 1
+      min_num_unmasked: 0
+      p_random: 0.5
+      p_bfs: 0.25
+      p_invbfs: 0.25
+    contrastive:
+      num_real: 50
+      num_fake: 50
+      pos_real_std: 0.05
+      pos_fake_std: 2.0
+      
+dataset:
+  train: ./data/GEOM/QM9/train_data_40k.pkl
+  val: ./data/GEOM/QM9/val_data_5k.pkl
+  test: ./data/GEOM/QM9/test_data_1k.pkl
+

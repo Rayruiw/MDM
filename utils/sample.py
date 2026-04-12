@@ -17,10 +17,8 @@ def adjacent_matrix(n_particles):
             cols.append(j)
             rows.append(j)
             cols.append(i)
-    # print(n_particles)
     rows = torch.LongTensor(rows).unsqueeze(0)
     cols = torch.LongTensor(cols).unsqueeze(0)
-    # print(rows.size())
     adj = torch.cat([rows, cols], dim=0)
     return adj
 
@@ -48,12 +46,15 @@ class DistributionNodes:
         self.n_nodes = []
         prob = []
         self.keys = {}
+
         for i, nodes in enumerate(histogram):
             self.n_nodes.append(nodes)
             self.keys[nodes] = i
             prob.append(histogram[nodes])
-        self.n_nodes = torch.tensor(self.n_nodes)
-        prob = np.array(prob)
+
+        self.n_nodes = torch.tensor(self.n_nodes, dtype=torch.long)
+
+        prob = np.array(prob, dtype=np.float64)
         prob = prob / np.sum(prob)
 
         self.prob = torch.from_numpy(prob).float()
@@ -61,7 +62,7 @@ class DistributionNodes:
         entropy = torch.sum(self.prob * torch.log(self.prob + 1e-30))
         print("Entropy of n_nodes: H[N]", entropy.item())
 
-        self.m = Categorical(torch.tensor(prob))
+        self.m = Categorical(self.prob)
 
     def sample(self, n_samples=1):
         idx = self.m.sample((n_samples,))
@@ -71,15 +72,43 @@ class DistributionNodes:
         assert len(batch_n_nodes.size()) == 1
 
         idcs = [self.keys[i.item()] for i in batch_n_nodes]
-        idcs = torch.tensor(idcs).to(batch_n_nodes.device)
+        idcs = torch.tensor(idcs, device=batch_n_nodes.device)
 
-        log_p = torch.log(self.prob + 1e-30)
-
-        log_p = log_p.to(batch_n_nodes.device)
-
+        log_p = torch.log(self.prob + 1e-30).to(batch_n_nodes.device)
         log_probs = log_p[idcs]
-
         return log_probs
+
+
+def _get_num_heavy_atoms_from_data(data):
+    if hasattr(data, 'num_heavy_atoms'):
+        n_heavy = data.num_heavy_atoms
+        if torch.is_tensor(n_heavy):
+            return n_heavy.view(-1)[0].float()
+        return torch.tensor(float(n_heavy), dtype=torch.float32)
+
+    if hasattr(data, 'atom_type'):
+        atom_type = data.atom_type
+        if not torch.is_tensor(atom_type):
+            atom_type = torch.tensor(atom_type)
+        return (atom_type.view(-1) != 1).sum().float()
+
+    raise AttributeError("Data object has neither 'num_heavy_atoms' nor 'atom_type'.")
+
+
+def _get_num_atoms_from_data(data):
+    if hasattr(data, 'num_atoms'):
+        n_atoms = data.num_atoms
+        if torch.is_tensor(n_atoms):
+            return int(n_atoms.view(-1)[0].item())
+        return int(n_atoms)
+
+    if hasattr(data, 'atom_type'):
+        return int(data.atom_type.size(0))
+
+    if hasattr(data, 'pos'):
+        return int(data.pos.size(0))
+
+    raise AttributeError("Data object has neither 'num_atoms', 'atom_type', nor 'pos'.")
 
 
 class DistributionProperty:
@@ -87,19 +116,48 @@ class DistributionProperty:
         self.num_bins = num_bins
         self.distributions = {}
         self.properties = properties
+        self.normalizer = normalizer
+
+        dataset = dataloader.dataset
+
+        num_atoms_all = []
+        prop_all = {prop: [] for prop in properties}
+
+        for i in range(len(dataset)):
+            data = dataset[i]
+            num_atoms_all.append(_get_num_atoms_from_data(data))
+
+            for prop in properties:
+                if prop == 'alpha_per_heavy':
+                    n_heavy = _get_num_heavy_atoms_from_data(data)
+                    v = (data.alpha.view(-1)[0].float() / n_heavy).item()
+
+                elif prop == 'Cv_per_heavy':
+                    n_heavy = _get_num_heavy_atoms_from_data(data)
+                    v = (data.Cv.view(-1)[0].float() / n_heavy).item()
+
+                else:
+                    v = getattr(data, prop)
+                    if torch.is_tensor(v):
+                        v = v.view(-1)[0].item()
+                    else:
+                        v = float(v)
+
+                prop_all[prop].append(float(v))
+
+        num_atoms_all = torch.tensor(num_atoms_all, dtype=torch.long)
+
         for prop in properties:
             self.distributions[prop] = {}
-            self._create_prob_dist(dataloader.dataset.data['num_atoms'],
-                                   dataloader.dataset.data[prop],
-                                   self.distributions[prop])
-
-        self.normalizer = normalizer
+            values = torch.tensor(prop_all[prop], dtype=torch.float32)
+            self._create_prob_dist(num_atoms_all, values, self.distributions[prop])
 
     def set_normalizer(self, normalizer):
         self.normalizer = normalizer
 
     def _create_prob_dist(self, nodes_arr, values, distribution):
         min_nodes, max_nodes = torch.min(nodes_arr), torch.max(nodes_arr)
+
         for n_nodes in range(int(min_nodes), int(max_nodes) + 1):
             idxs = nodes_arr == n_nodes
             values_filtered = values[idxs]
@@ -108,38 +166,61 @@ class DistributionProperty:
                 distribution[n_nodes] = {'probs': probs, 'params': params}
 
     def _create_prob_given_nodes(self, values):
-        n_bins = self.num_bins  # min(self.num_bins, len(values))
+        n_bins = self.num_bins
         prop_min, prop_max = torch.min(values), torch.max(values)
         prop_range = prop_max - prop_min + 1e-12
-        histogram = torch.zeros(n_bins)
+
+        histogram = torch.zeros(n_bins, dtype=torch.float32)
+
         for val in values:
             i = int((val - prop_min) / prop_range * n_bins)
-            # Because of numerical precision, one sample can fall in bin int(n_bins) instead of int(n_bins-1)
-            # We move it to bin int(n_bind-1 if tat happens)
             if i == n_bins:
                 i = n_bins - 1
             histogram[i] += 1
+
         probs = histogram / torch.sum(histogram)
-        probs = Categorical(torch.tensor(probs))
+        probs = Categorical(probs)
         params = [prop_min, prop_max]
         return probs, params
 
     def normalize_tensor(self, tensor, prop):
-        # print(self.normalizer)
         assert self.normalizer is not None
+
         mean = self.normalizer[prop]['mean']
         mad = self.normalizer[prop]['mad']
+
+        if torch.is_tensor(mean):
+            mean = mean.to(tensor.device, dtype=tensor.dtype)
+        else:
+            mean = torch.tensor(mean, device=tensor.device, dtype=tensor.dtype)
+
+        if torch.is_tensor(mad):
+            mad = mad.to(tensor.device, dtype=tensor.dtype)
+        else:
+            mad = torch.tensor(mad, device=tensor.device, dtype=tensor.dtype)
+
+        if mad.item() == 0:
+            mad = torch.tensor(1.0, device=tensor.device, dtype=tensor.dtype)
+
         return (tensor - mean) / mad
 
     def sample(self, n_nodes=19):
         vals = []
+
         for prop in self.properties:
-            dist = self.distributions[prop][n_nodes]
+            if n_nodes not in self.distributions[prop]:
+                available_nodes = sorted(self.distributions[prop].keys())
+                nearest_n = min(available_nodes, key=lambda x: abs(x - int(n_nodes)))
+                dist = self.distributions[prop][nearest_n]
+            else:
+                dist = self.distributions[prop][n_nodes]
+
             idx = dist['probs'].sample((1,))
             val = self._idx2value(idx, dist['params'], len(dist['probs'].probs))
             val = self.normalize_tensor(val, prop)
             vals.append(val)
-        vals = torch.cat(vals)
+
+        vals = torch.cat(vals, dim=0)
         return vals
 
     def sample_batch(self, nodesxsample):
@@ -150,11 +231,21 @@ class DistributionProperty:
         return vals
 
     def _idx2value(self, idx, params, n_bins):
-        prop_range = params[1] - params[0]
-        left = float(idx) / n_bins * prop_range + params[0]
-        right = float(idx + 1) / n_bins * prop_range + params[0]
-        val = torch.rand(1) * (right - left) + left
-        return val
+        prop_min, prop_max = params
+
+        if not torch.is_tensor(prop_min):
+            prop_min = torch.tensor(prop_min, dtype=torch.float32)
+        if not torch.is_tensor(prop_max):
+            prop_max = torch.tensor(prop_max, dtype=torch.float32)
+
+        idx = idx.view(-1)[0].float()
+
+        prop_range = prop_max - prop_min
+        left = idx / n_bins * prop_range + prop_min
+        right = (idx + 1) / n_bins * prop_range + prop_min
+
+        val = torch.rand(1, device=left.device, dtype=left.dtype) * (right - left) + left
+        return val.view(1)
 
 
 n_nodes = {26: 4711, 31: 3365, 19: 3093, 22: 3344, 32: 3333, 25: 4533,
@@ -180,60 +271,20 @@ def construct_dataset(num_sample, batch_size, dataset_info):
     data_list = []
 
     num_atom = len(dataset_info['atom_decoder']) + 1  # charge
-    # num_atom = 20
     nodesxsample_list = []
+
     for _ in tqdm(range(int(num_sample / batch_size))):
         datas = []
         nodesxsample = nodes_dist.sample(batch_size).tolist()
         nodesxsample_list.append(nodesxsample)
-        # atom_type_list = torch.randn(batch_size,MAX_NODES,6)
-        # pos_list = torch.randn(batch_size,MAX_NODES,3)
+
         for n_particles in nodesxsample:
-            # n_particles = 19
             atom_type = torch.randn(n_particles, num_atom)
             pos = torch.randn(n_particles, 3)
-            # atom_type = torch.zeros(n_particles, num_atom).uniform_(-3,+3)
-            # pos = torch.zeros(n_particles, 3).uniform_(-3,+3)
-            # atom_type = torch.randn(MAX_NODES, 5)[:n_particles,:]
-            # pos = torch.randn(MAX_NODES, 3)[:n_particles,:]
-            # atom_type = atom_type_list[i,:n_particles,:].squeeze(0)
-            # pos = pos_list[i,:n_particles,:].squeeze(0)
-
-            # coors = pos
             adj = adjacent_matrix(n_particles)
             data = Data(x=atom_type, edge_index=adj, pos=pos)
             datas.append(data)
+
         data_list.append(datas)
+
     return data_list, nodesxsample_list
-
-# def construct_dataset_pocket(num_sample, batch_size, dataset_info, num_points=None, *protein_information):
-#     nodes_dist = DistributionNodes(dataset_info['n_nodes'])
-#     data_list = []
-
-#     num_atom = len(dataset_info['atom_decoder']) + 1  # charge
-#     # num_atom = 20
-#     nodesxsample_list = []
-#     protein_atom_feature_full, protein_pos, protein_bond_index = protein_information
-#     for n in tqdm(range(int(num_sample / batch_size))):
-#         datas = []
-#         if num_points is not None:
-#             nodesxsample = nodes_dist.sample(batch_size - 1).tolist().append(num_points)
-#         else:
-#             nodesxsample = nodes_dist.sample(batch_size).tolist()
-#         nodesxsample_list.append(nodesxsample)
-#         # atom_type_list = torch.randn(batch_size,MAX_NODES,6)
-#         # pos_list = torch.randn(batch_size,MAX_NODES,3)
-#         for i, n_particles in enumerate(nodesxsample):
-#             # n_particles = 19
-#             # atom_type = torch.randn(n_particles, num_atom)
-#             # pos = torch.randn(n_particles, 3)
-#             atom_type = torch.zeros(n_particles, num_atom).uniform_(-3, +3)
-#             pos = torch.zeros(n_particles, 3).uniform_(-3, +3)
-#             coors = pos
-#             adj = adjacent_matrix(n_particles)
-#             data = Data(ligand_atom_type=atom_type, ligand_bond_index=adj, ligand_pos=pos,
-#                         protein_atom_feature_full=protein_atom_feature_full, protein_pos=protein_pos,
-#                         protein_bond_index=protein_bond_index)
-#             datas.append(data)
-#         data_list.append(datas)
-#     return data_list, nodesxsample_list

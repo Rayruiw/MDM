@@ -7,6 +7,7 @@ from torch_geometric.utils import to_dense_adj, dense_to_sparse
 from torch_scatter import scatter_mean, scatter_add, scatter_max
 from torch_sparse import coalesce
 
+# 暂时改一下from utils.chem import BOND_TYPES
 from utils.chem import BOND_TYPES
 
 

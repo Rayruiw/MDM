@@ -1,11 +1,12 @@
 # types
-
+from torch_scatter import scatter
 from typing import List
-
+import inspect
+import torch
 from einops import rearrange
 
 # types
-
+from torch_geometric.utils import scatter
 # pytorch geometric
 
 try:
@@ -224,57 +225,109 @@ class EGNNSparse(MessagePassing):
             # print('*************************')
         return m_ij
 
-    def propagate(self, edge_index: Adj, size: Size = None, **kwargs):
-        """The initial call to start propagating messages.
-            Args:
-            `edge_index` holds the indices of a general (sparse)
-                assignment matrix of shape :obj:`[N, M]`.
-            size (tuple, optional) if none, the size will be inferred
-                and assumed to be quadratic.
-            **kwargs: Any additional data which is needed to construct and
-                aggregate messages, and to update node embeddings.
+    def propagate(self, edge_index, size=None, **kwargs):
         """
-        size = self.__check_input__(edge_index, size)
-        coll_dict = self.__collect__(self.__user_args__,
-                                     edge_index, size, kwargs)
-        msg_kwargs = self.inspector.distribute('message', coll_dict)
-        aggr_kwargs = self.inspector.distribute('aggregate', coll_dict)
-        update_kwargs = self.inspector.distribute('update', coll_dict)
+        一版兼容 PyG 2.4 的手写 propagate：
+        - 不使用 Inspector/__collect__/__check_input__
+        - 以 x 的行数为权威 num_nodes，所有 scatter(..., dim_size=num_nodes)
+        - 自动回退构造 rel_coors（若未提供且给了 coors）
+        - 对 coors/x 做长度对齐防御（极端情况下）
+        期望 kwargs:
+            x:        (N, F)
+            coors:    (N, 3)   可选
+            rel_coors:(E, 3)   可选；若缺省且给了 coors，则用 coors[i]-coors[j]
+            edge_attr:(E, Fe)  可选
+            batch:    (N,)     可选
+        返回：
+            self.update((hidden_out, coors_out), **update_kwargs)
+            其中 update_kwargs 默认为空；如果你的 update(...) 需要别的键，可以在此补充。
+        """
+        # ---------- 基础输入 ----------
+        if 'x' not in kwargs:
+            raise ValueError("propagate() requires 'x' in kwargs")
+        x        = kwargs['x']                    # (N, F)
+        coors    = kwargs.get('coors', None)      # (N, 3) or None
+        rel      = kwargs.get('rel_coors', None)  # (E, 3) or None
+        edge_attr= kwargs.get('edge_attr', None)  # (E, Fe) or None
+        batch    = kwargs.get('batch', None)      # (N,) or None
 
-        #  get messages
-        m_ij = self.message(**msg_kwargs)
+        device = x.device
+        # 以特征长度为权威节点数，避免 edge_index 推断丢孤立点
+        num_nodes = x.size(0)
+        size = (num_nodes, num_nodes)
 
-        # update coors if specified
-        if self.update_coors:
-            coor_wij = self.coors_mlp(m_ij)
-            # clamp if arg is set
-            # if self.coor_weights_clamp_value:
-            #     coor_weights_clamp_value = self.coor_weights_clamp_value
-            #     coor_weights.clamp_(min=-clamp_value, max=clamp_value)
+        # ---------- 边索引与索引切片 ----------
+        # 确保 long / device 一致
+        if not torch.is_tensor(edge_index):
+            raise TypeError("edge_index must be a tensor of shape [2, E]")
+        edge_index = edge_index.to(device=device, dtype=torch.long)
+        i, j = edge_index[0], edge_index[1]       # 目标/源（与 PyG MessagePassing 约定一致）
 
-            # normalize if needed
-            kwargs["rel_coors"] = self.coors_norm(kwargs["rel_coors"])
+        # 取对应端点特征
+        x_i, x_j = x[i], x[j]                     # (E, F)
 
-            mhat_i = self.aggregate(coor_wij * kwargs["rel_coors"], **aggr_kwargs)
-            coors_out = kwargs["coors"] + mhat_i
+        # ---------- 长度防御：coors 与 x 对齐 ----------
+        if coors is not None and coors.size(0) != num_nodes:
+            Nc = coors.size(0)
+            if Nc > num_nodes:
+                coors = coors[:num_nodes]
+            else:
+                pad = coors.new_zeros(num_nodes - Nc, *coors.shape[1:])
+                coors = torch.cat([coors, pad], dim=0)
+
+        # ---------- rel_coors 构造 / 归一 ----------
+        if rel is None and coors is not None:
+            # 回退：用坐标差作为相对坐标
+            rel = coors[i] - coors[j]             # (E, 3)
+        if rel is not None and hasattr(self, "coors_norm") and self.coors_norm:
+            # 有些实现把 coors_norm 设计成一个 nn.Module / 函数
+            rel = self.coors_norm(rel)
+
+        # ---------- 计算消息 ----------
+        # 注意：EGNNSparse.message(...) 的签名中若没有 coors/rel_coors，就不要传它们
+        # 常见签名：message(self, x_i, x_j, edge_attr=None, **kwargs)
+        if edge_attr is not None:
+            m_ij = self.message(x_i=x_i, x_j=x_j, edge_attr=edge_attr)
         else:
-            coors_out = kwargs["coors"]
+            m_ij = self.message(x_i=x_i, x_j=x_j)  # (E, hidden)
 
-        # update feats if specified
-        if self.update_feats:
-            # weight the edges if arg is passed
-            # if self.soft_edge:
-            #     m_ij = m_ij * self.edge_weight(m_ij)
-            m_i = self.aggregate(m_ij, **aggr_kwargs)
+        # ---------- 坐标更新 ----------
+        if getattr(self, "update_coors", False):
+            if not hasattr(self, "coors_mlp"):
+                raise AttributeError("update_coors=True 但未定义 self.coors_mlp")
+            if rel is None:
+                raise ValueError("update_coors=True 需要提供 rel_coors 或 coors 以构造相对坐标")
 
-            hidden_feats = self.node_norm(kwargs["x"], kwargs["batch"]) if self.node_norm else kwargs["x"]
-            hidden_out = self.node_mlp(torch.cat([hidden_feats, m_i], dim=-1))
-            hidden_out = kwargs["x"] + hidden_out
+            coor_wij = self.coors_mlp(m_ij)       # (E, 3) or (E, C) 与 rel 做逐元素相乘
+            # 聚合到目标结点 i，强制 dim_size=num_nodes 避免长度不一致
+            mhat_i = scatter(coor_wij * rel, i, dim=0, dim_size=num_nodes, reduce='sum')  # (N, 3)
+            coors_out = (coors + mhat_i) if coors is not None else mhat_i
         else:
-            hidden_out = kwargs["x"]
+            coors_out = coors
 
-        # return tuple
-        return self.update((hidden_out, coors_out), **update_kwargs)
+        # ---------- 特征更新 ----------
+        if getattr(self, "update_feats", True):
+            # 边权/软边等在此处乘到 m_ij 上（如果你的实现需要）
+            m_i = scatter(m_ij, i, dim=0, dim_size=num_nodes, reduce='sum')  # (N, hidden)
+
+            if hasattr(self, "node_norm") and self.node_norm:
+                # 一些实现把 node_norm 作为 Module，接受 (x, batch)
+                hidden_feats = self.node_norm(x, batch) if batch is not None else self.node_norm(x)
+            else:
+                hidden_feats = x
+
+            if not hasattr(self, "node_mlp"):
+                raise AttributeError("update_feats=True 但未定义 self.node_mlp")
+
+            hidden_out = self.node_mlp(torch.cat([hidden_feats, m_i], dim=-1))  # (N, F)
+            hidden_out = x + hidden_out
+        else:
+            hidden_out = x
+
+        # ---------- 返回 update() ----------
+        # 若你的 update(...) 需要更多参数，可在此补充 update_kwargs
+        return self.update((hidden_out, coors_out))
+
 
     def __repr__(self):
         return "E(n)-GNN Layer for Graphs " + str(self.__dict__)
@@ -464,3 +517,7 @@ class EGNNSparseNetwork(nn.Module):
 
     def __repr__(self):
         return 'EGNNSparseNetwork of: {0} layers'.format(len(self.mpnn_layers))
+
+    def aggregate(self, inputs, index, dim_size=None, reduce='add'):
+    # 自定义聚合函数，兼容 PyG 2.4 不再自动提供 scatter 聚合
+        return scatter(inputs, index, dim=0, dim_size=dim_size, reduce=reduce)

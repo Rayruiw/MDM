@@ -174,50 +174,66 @@ class CountNodesPerGraph(object):
 
 
 class GetAdj(object):
-    def __init__(self) -> None:
+    def __init__(self, radius=None) -> None:
         super().__init__()
+        self.radius = radius  # ✅ 可选，不影响原有逻辑
 
     def __call__(self, data):
-        '''
-        full connected edges
-        '''
-
+        """
+        fully connected edges
+        (如果将来想用半径筛选，可以利用 self.radius)
+        """
         n_particles = data.num_nodes
         coors = data.pos
         rows, cols = [], []
         for i in range(n_particles):
             for j in range(i + 1, n_particles):
+                # 若定义了 cutoff，可在此筛选距离
+                if self.radius is not None:
+                    dist = torch.norm(coors[i] - coors[j])
+                    if dist > self.radius:
+                        continue
                 rows.append(i)
                 cols.append(j)
                 rows.append(j)
                 cols.append(i)
-        # print(n_particles)
+
         rows = torch.LongTensor(rows).unsqueeze(0)
         cols = torch.LongTensor(cols).unsqueeze(0)
-        # print(rows.size())
         adj = torch.cat([rows, cols], dim=0)
-        rel_coors = coors[adj[0]] - coors[adj[1]]
-        rel_dist = (rel_coors ** 2).sum(dim=-1, keepdim=True)
-        data.edge_index = adj
-        data.edge_type = rel_dist.squeeze(1)
-        return data
 
+        rel_coors = coors[adj[0]] - coors[adj[1]]
+        rel_dist = (rel_coors ** 2).sum(dim=-1, keepdim=True).sqrt()  # ✅ 距离
+
+        # ✅ 保留你当前版本的输出
+        data.edge_index = adj
+        data.edge_length = rel_dist.squeeze(1)   # [E]
+        data.edge_attr = rel_coors               # [E, 3]
+        data.edge_type = data.edge_length        # [E]
+        return data
 
 class AtomFeat(object):
     def __init__(self, atom_index) -> None:
         super().__init__()
-        self.atom_index = atom_index
+        self.atom_index = atom_index  # 期望是 Z->idx
 
     def __call__(self, data):
-        '''
+        """
         one-hot feature
-        '''
-        atom_type = data.atom_type.tolist()
-        # print(data.atom_type)
-        atom_type = torch.tensor([self.atom_index[i] for i in atom_type])
-        # print(atom_type)
-        data.atom_feat = F.one_hot(atom_type, num_classes=len(self.atom_index))
+        data.atom_type: 通常是原子序 Z（如 1,6,7,8,9）
+        将其通过 Z->idx 映射到类别索引，再做 one-hot
+        """
+        z_vals = data.atom_type.tolist()
+        idx_list = [self.atom_index.get(int(i), 0) for i in z_vals]  # ✅ 容错
+        idx = torch.tensor(idx_list, dtype=torch.long)
 
+        num_classes = max(self.atom_index.values()) + 1  # 例如 5
+        data.atom_feat = F.one_hot(idx, num_classes=num_classes).float()
+
+        # 维持你原来的拼接：one-hot + 原子序本身
         data.atom_feat_full = torch.cat([data.atom_feat, data.atom_type.unsqueeze(1)], dim=1)
 
+        # 可同步提供 data.x / data.z，方便下游统一使用
+        data.x = data.atom_feat
+        data.z = idx
         return data

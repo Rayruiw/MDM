@@ -166,7 +166,7 @@ if __name__ == "__main__":
                         help='maximum power to take into one-hot features')
     parser.add_argument('--dataset', type=str, default="qm9_first_half", metavar='N',
                         help='qm9_first_half')
-    parser.add_argument('--datadir', type=str, default="../../data/QM9/qm9/raw", metavar='N',
+    parser.add_argument('--datadir', type=str, default="../../data/QM9", metavar='N',
                         help='qm9_first_half')
     parser.add_argument('--remove_h', action='store_true')
     parser.add_argument('--include_charges', type=eval, default=True, help='include atom charge or not')
@@ -180,8 +180,22 @@ if __name__ == "__main__":
                         help='egnn | naive | numnodes')
     parser.add_argument('--save_model', type=eval, default=True)
 
-    
     args = parser.parse_args()
+    print("args.datadir =", args.datadir)
+    print("type(args.datadir) =", type(args.datadir))
+    print("args.dataset =", args.dataset)
+    print("type(args.dataset) =", type(args.dataset))
+
+    if isinstance(args.datadir, list):
+        if len(args.datadir) == 0:
+            raise ValueError("args.datadir is empty")
+        args.datadir = args.datadir[0]
+
+    if isinstance(args.dataset, list):
+        if len(args.dataset) == 0:
+            raise ValueError("args.dataset is empty")
+        args.dataset = args.dataset[0]
+
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if args.cuda else "cpu")
     dtype = torch.float32
@@ -200,7 +214,10 @@ if __name__ == "__main__":
     dataloaders["test"] = dataloaders_aux["train"]
 
     # compute mean and mean absolute deviation
-    property_norms = utils.compute_mean_mad_from_dataloader(dataloaders['valid'], [args.property])
+    # compute mean and mean absolute deviation
+    property_norms = utils.compute_mean_mad_from_dataloader(
+        dataloaders['valid'].dataset, [args.property]
+    )
     mean, mad = property_norms[args.property]['mean'], property_norms[args.property]['mad']
 
     model = get_model(args)

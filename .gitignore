@@ -1,0 +1,23 @@
+# 必须要保留的
+!environment.yml
+!project/
+
+# 必须要过滤的垃圾
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# 过滤 project 里的运行产物（保留脚本，丢弃大数据）
+project/outputs/
+project/checkpoints/
+project/**/*.pt
+project/**/*.npy
+project/**/*.pickle
+
+# 过滤掉其他大型数据和日志
+data/
+logs/
+logs_clf/
+results/
+visulization/

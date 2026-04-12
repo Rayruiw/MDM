@@ -33,7 +33,6 @@ parser.add_argument("--context", nargs='+', default=[],
 
 def train(it):
     model.train()
-    train_sampler.set_epoch(it)
     sum_loss, sum_n = 0, 0
     sum_loss_pos_global, sum_loss_pos_local = 0, 0
     sum_loss_node_global, sum_loss_node_local = 0, 0
@@ -41,7 +40,7 @@ def train(it):
         for batch in train_loader:
             optimizer_global.zero_grad()
             optimizer_local.zero_grad()
-            batch = batch.to(local_rank)
+            batch = batch.to(device)
             if len(args.context) > 0:
                 context = prepare_context(args.context, batch, property_norms)
             else:
@@ -80,23 +79,23 @@ def train(it):
     avg_loss_pos_local = sum_loss_pos_local / sum_n
     avg_loss_node_local = sum_loss_node_local / sum_n
 
-    if dist.get_rank() == 0:
-        logger.info(
-            f'[Train] Iter {it:05d} | Loss {loss.item():,2f} | '
-            f'Loss(pos_Global) {avg_loss_pos_global:.2f} | Loss(pos_Local) {avg_loss_pos_local:.2f} | '
-            f'Loss(node_global) {avg_loss_node_global:.2f} | Loss(node_local) {avg_loss_node_local:.2f} | '
-            f'Loss(vae_KL) {loss_vae_kl:.2f} |Grad {orig_grad_norm:.2f} | '
-            f'LR {optimizer_global.param_groups[0]["lr"]:.6f}'
-        )
-        writer.add_scalar('train/loss', avg_loss, it)
-        writer.add_scalar('train/loss_pos_global', avg_loss_pos_global, it)
-        writer.add_scalar('train/loss_node_global', avg_loss_node_global, it)
-        writer.add_scalar('train/loss_pos_local', avg_loss_pos_local, it)
-        writer.add_scalar('train/loss_node_local', avg_loss_node_local, it)
-        writer.add_scalar('train/loss_vae_KL', loss_vae_kl, it)
-        writer.add_scalar('train/lr', optimizer_global.param_groups[0]['lr'], it)
-        writer.add_scalar('train/grad_norm', orig_grad_norm, it)
-        writer.flush()
+
+    logger.info(
+        f'[Train] Iter {it:05d} | Loss {loss.item():.2f} | '
+        f'Loss(pos_Global) {avg_loss_pos_global:.2f} | Loss(pos_Local) {avg_loss_pos_local:.2f} | '
+        f'Loss(node_global) {avg_loss_node_global:.2f} | Loss(node_local) {avg_loss_node_local:.2f} | '
+        f'Loss(vae_KL) {loss_vae_kl:.2f} |Grad {orig_grad_norm:.2f} | '
+        f'LR {optimizer_global.param_groups[0]["lr"]:.6f}'
+    )
+    writer.add_scalar('train/loss', avg_loss, it)
+    writer.add_scalar('train/loss_pos_global', avg_loss_pos_global, it)
+    writer.add_scalar('train/loss_node_global', avg_loss_node_global, it)
+    writer.add_scalar('train/loss_pos_local', avg_loss_pos_local, it)
+    writer.add_scalar('train/loss_node_local', avg_loss_node_local, it)
+    writer.add_scalar('train/loss_vae_KL', loss_vae_kl, it)
+    writer.add_scalar('train/lr', optimizer_global.param_groups[0]['lr'], it)
+    writer.add_scalar('train/grad_norm', orig_grad_norm, it)
+    writer.flush()
 
 
 def validate(it):
@@ -107,7 +106,7 @@ def validate(it):
     with torch.no_grad():
         model.eval()
         for batch in tqdm(val_loader, desc='Validation'):
-            batch = batch.to(local_rank)
+            batch = batch.to(device)
             if len(args.context) > 0:
                 context = prepare_context(args.context, batch, property_norms_val)
             else:
@@ -146,27 +145,25 @@ def validate(it):
         if 'global' not in config.model.network:
             scheduler_local.step()
 
-    if dist.get_rank() == 0:
-        logger.info('[Validate] Iter %05d | Loss %.6f ' % (
-            it, avg_loss
-        ))
-        writer.add_scalar('val/loss', avg_loss, it)
-        writer.flush()
+
+    logger.info('[Validate] Iter %05d | Loss %.6f ' % (
+        it, avg_loss
+    ))
+    writer.add_scalar('val/loss', avg_loss, it)
+    writer.flush()
     return avg_loss
 
 
 # ------------------------------------------------------------------------------
-# Training file in ddp mode
+# Training file  not in ddp mode
 # ------------------------------------------------------------------------------
 if __name__ == '__main__':
-    parser.add_argument("--local_rank", default=-1, type=int)
     args = parser.parse_args()
     args.cuda = args.cuda and torch.cuda.is_available()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl')
-    device = torch.device("cuda", local_rank)
-
+    if args.cuda:
+        device = 'cuda'
+    else:
+        device = 'cpu'
     args.dataset = 'qm9' if 'qm9' in args.config else 'geom'
 
     resume = os.path.isdir(args.config)
@@ -195,14 +192,14 @@ if __name__ == '__main__':
     logger = get_logger('train', log_dir)
 
     # Logging
-    if dist.get_rank() == 0:
-        writer = torch.utils.tensorboard.SummaryWriter(log_dir)
-        logger.info(args)
-        logger.info(config)
-        shutil.copyfile(config_path, os.path.join(log_dir, os.path.basename(config_path)))
-        shutil.copyfile('./train_full.py', os.path.join(log_dir, 'train_full.py'))
-        # Datasets and loaders
-        logger.info('Loading %s datasets...' % (args.dataset))
+    
+    writer = torch.utils.tensorboard.SummaryWriter(log_dir)
+    logger.info(args)
+    logger.info(config)
+    shutil.copyfile(config_path, os.path.join(log_dir, os.path.basename(config_path)))
+    shutil.copyfile('./train.py', os.path.join(log_dir, 'train.py'))
+    # Datasets and loaders
+    logger.info('Loading %s datasets...' % (args.dataset))
 
     dataset_info = get_dataset_info(args.dataset, remove_h=False)
     transforms = Compose([CountNodesPerGraph(), GetAdj(), AtomFeat(dataset_info['atom_index'])])
@@ -211,14 +208,12 @@ if __name__ == '__main__':
     if args.dataset == 'qm9':
         train_set = QM93D('train', pre_transform=transforms)
         val_set = QM93D('valid', pre_transform=transforms)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_set, shuffle=False)
-        val_loader = DataLoader(val_set, config.train.batch_size, sampler=val_sampler)
+        val_loader = DataLoader(val_set, config.train.batch_size, shuffle=False)
     elif args.dataset == 'geom':
         train_set = Geom(pre_transform=transforms)
     else:
         raise Exception('Wrong dataset name')
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=True)
-    train_loader = DataLoader(train_set, config.train.batch_size, sampler=train_sampler)
+    train_loader = DataLoader(train_set, config.train.batch_size, shuffle=True)
 
     # if context
     # args.context = ['alpha']
@@ -231,18 +226,16 @@ if __name__ == '__main__':
         context = None
 
     # Model
-    if dist.get_rank() == 0:
-        logger.info('Building model...')
+    logger.info('Building model...')
     config.model.context = args.context
     config.model.num_atom = len(dataset_info['atom_decoder']) + 1
 
-    model = get_model(config.model).to(local_rank)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    model = get_model(config.model).to(device)
 
     # Optimizer
-    optimizer_global = get_optimizer(config.train.optimizer, model.module.model_global)
+    optimizer_global = get_optimizer(config.train.optimizer, model.model_global)
     scheduler_global = get_scheduler(config.train.scheduler, optimizer_global)
-    optimizer_local = get_optimizer(config.train.optimizer, model.module.model_local)
+    optimizer_local = get_optimizer(config.train.optimizer, model.model_local)
     scheduler_local = get_scheduler(config.train.scheduler, optimizer_local)
 
     start_iter = 0
@@ -264,21 +257,20 @@ if __name__ == '__main__':
         start_time = time.time()
         train(it)
         end_time = (time.time() - start_time)
-        if dist.get_rank() == 0:
-            print('each iteration requires {} s'.format(end_time))
-            avg_val_loss = validate(it)
-            if it % config.train.val_freq == 0:
-                if avg_val_loss < best_val_loss:
-                    ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
-                    torch.save({
-                        'config': config,
-                        'model': model.module.state_dict(),
-                        'optimizer_global': optimizer_global.state_dict(),
-                        'scheduler_global': scheduler_global.state_dict(),
-                        'optimizer_local': optimizer_local.state_dict(),
-                        'scheduler_local': scheduler_local.state_dict(),
-                        'iteration': it,
-                        'avg_val_loss': avg_val_loss,
-                    }, ckpt_path)
-                    print('Successfully saved the model!')
-                    best_val_loss = avg_val_loss
+        print('each iteration requires {} s'.format(end_time))
+        avg_val_loss = validate(it)
+        if it % config.train.val_freq == 0:
+            if avg_val_loss < best_val_loss:
+                ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
+                torch.save({
+                    'config': config,
+                    'model': model.state_dict(),
+                    'optimizer_global': optimizer_global.state_dict(),
+                    'scheduler_global': scheduler_global.state_dict(),
+                    'optimizer_local': optimizer_local.state_dict(),
+                    'scheduler_local': scheduler_local.state_dict(),
+                    'iteration': it,
+                    'avg_val_loss': avg_val_loss,
+                }, ckpt_path)
+                print('Successfully saved the model!')
+                best_val_loss = avg_val_loss

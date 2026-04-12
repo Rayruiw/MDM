@@ -160,6 +160,21 @@ crossdock_with_h = {
                 3: 4, 53: 3, 65: 2, 106: 2, 71: 1, 62: 1, 86: 1, 77: 1, 68: 1, 98: 1},
 }
 
+macrolides_with_h = {
+    'name': 'macrolides',
+    'atom_index': {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 15: 5, 16: 6, 17: 7, 35: 8, 53: 9},
+    'atom_encoder': {'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 'P': 5, 'S': 6, 'Cl': 7, 'Br': 8, 'I': 9},
+    'atomic_nb': [1, 6, 7, 8, 9, 15, 16, 17, 35, 53],
+    'atom_decoder': ['H', 'C', 'N', 'O', 'F', 'P', 'S', 'Cl', 'Br', 'I'],
+    'max_n_nodes': 100,
+    'n_nodes': {},
+    'atom_types': {},
+    'distances': [],
+    'colors_dic': ['#FFFFFF99', 'C7', 'C0', 'C3', 'C1', 'C5', 'C6', 'C2', 'C4', 'C8'],
+    'radius_dic': [0.46, 0.77, 0.77, 0.77, 0.77, 0.90, 0.90, 1.00, 1.10, 1.25],
+    'with_h': True,
+}
+
 
 def get_dataset_info(dataset_name, remove_h):
     if dataset_name == 'qm9':
@@ -182,5 +197,11 @@ def get_dataset_info(dataset_name, remove_h):
             return qm9_second_half
         else:
             raise Exception('Missing config for %s without hydrogens' % dataset_name)
+    elif dataset_name == 'macrolides':
+        if not remove_h:
+            return macrolides_with_h
+        else:
+            raise Exception('Missing config for %s without hydrogens' % dataset_name)
+
     else:
         raise Exception("Wrong dataset %s" % dataset_name)

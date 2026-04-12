@@ -8,6 +8,33 @@ import numpy as np
 import torch
 from torch_geometric.data import Batch
 
+# ===== Early Stopping helper =====
+class EarlyStopper:
+    def __init__(self, patience=10, min_delta=1e-4, mode='min'):
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.mode = mode
+        self.best = None
+        self.bad_count = 0
+
+    def is_better(self, value):
+        if self.best is None:
+            return True
+        if self.mode == 'min':
+            return value < self.best - self.min_delta
+        else:
+            return value > self.best + self.min_delta
+
+    def step(self, value):
+        """返回 True 表示需要早停"""
+        if self.is_better(value):
+            self.best = value
+            self.bad_count = 0
+            return False
+        else:
+            self.bad_count += 1
+            return self.bad_count >= self.patience
+# =================================
 
 class BlackHole(object):
     def __setattr__(self, name, value):

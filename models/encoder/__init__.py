@@ -3,7 +3,7 @@ from .gin import *
 from .schnet import *
 from .edge import *
 # from .spherenet import *
-
+from .painn import PaiNN  # 这行是关键！
 
 def get_encoder(config):
     if config.name == 'egnn':

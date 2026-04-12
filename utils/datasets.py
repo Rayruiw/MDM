@@ -22,7 +22,7 @@ from tqdm import tqdm
 RDLogger.DisableLog('rdApp.*')
 
 from .chem import BOND_TYPES, mol_to_smiles
-
+from .Macrolides_dataset import MacrolidesDataset
 
 class QM93D(InMemoryDataset):
     r"""
@@ -31,42 +31,6 @@ class QM93D(InMemoryDataset):
         It connsists of about 130,000 equilibrium molecules with 12 regression targets:
         :obj:`mu`, :obj:`alpha`, :obj:`homo`, :obj:`lumo`, :obj:`gap`, :obj:`r2`, :obj:`zpve`, :obj:`U0`, :obj:`U`, :obj:`H`, :obj:`G`, :obj:`Cv`.
         Each molecule includes complete spatial information for the single low energy conformation of the atoms in the molecule.
-        .. note::
-            We used the processed data in `DimeNet <https://github.com/klicperajo/dimenet/tree/master/data>`_, wihch includes spatial information and type for each atom.
-            You can also use `QM9 in Pytorch Geometric <https://pytorch-geometric.readthedocs.io/en/latest/_modules/torch_geometric/datasets/qm9.html#QM9>`_.
-
-        Args:
-            root (string): the dataset folder will be located at root/qm9.
-            transform (callable, optional): A function/transform that takes in an
-                :obj:`torch_geometric.data.Data` object and returns a transformed
-                version. The data object will be transformed before every access.
-                (default: :obj:`None`)
-            pre_transform (callable, optional): A function/transform that takes in
-                an :obj:`torch_geometric.data.Data` object and returns a
-                transformed version. The data object will be transformed before
-                being saved to disk. (default: :obj:`None`)
-            pre_filter (callable, optional): A function that takes in an
-                :obj:`torch_geometric.data.Data` object and returns a boolean
-                value, indicating whether the data object should be included in the
-                final dataset. (default: :obj:`None`)
-        Example:
-        --------
-        >>> dataset = QM93D()
-        >>> target = 'mu'
-        >>> dataset.data.y = dataset.data[target]
-        >>> split_idx = dataset.get_idx_split(len(dataset.data.y), train_size=110000, valid_size=10000, seed=42)
-        >>> train_dataset, valid_dataset, test_dataset = dataset[split_idx['train']], dataset[split_idx['valid']], dataset[split_idx['test']]
-        >>> train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        >>> data = next(iter(train_loader))
-        >>> data
-        Batch(Cv=[32], G=[32], H=[32], U=[32], U0=[32], alpha=[32], batch=[579], gap=[32], homo=[32], lumo=[32], mu=[32], pos=[579, 3], ptr=[33], r2=[32], y=[32], z=[579], zpve=[32])
-        Where the attributes of the output data indicates:
-
-        * :obj:`z`: The atom type.
-        * :obj:`pos`: The 3D position for atoms.
-        * :obj:`y`: The target property for the graph (molecule).
-        * :obj:`batch`: The assignment vector which maps each node to its respective graph identifier
-        and can help reconstructe single graphs
     """
 
     def __init__(self, split, condition=None, root='./data/QM9', transform=None, pre_transform=None, pre_filter=None):
@@ -78,64 +42,64 @@ class QM93D(InMemoryDataset):
 
         super(QM93D, self).__init__(self.folder, transform, pre_transform, pre_filter)
 
-        self.processed_paths[0] = './data/QM9.qm9'
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def raw_file_names(self):
-        return '%s.npz' % self.split
+        return f'{self.split}.npz'
 
     @property
     def processed_file_names(self):
-        if self.condition is None:
-            return 'qm9_pyg_%s.pt' % self.split
-        else:
-            return 'qm9_pyg_%s_%s.pt' % (self.split, self.condition)
+        return f'qm9_pyg_{self.split}.pt'
 
     def download(self):
         download_url(self.url, self.raw_dir)
 
     def process(self):
-        if self.condition is not None:
-            if self.condition == 'gap':
-                p_threshold = 4.5 * 0.036749344227551  # 1ev = 0.036749344227551 Ha
-            elif self.condition == 'alpha':
-                p_threshold = 91
-            else:
-                raise Exception('Wrong condition name')
         raw_dir = './data/QM9/qm9/raw'
         data = np.load(osp.join(raw_dir, self.raw_file_names))
 
         R = data['positions']
         Z = data['charges']
         N = data['num_atoms']
-        # split = np.cumsum(N)
-        # R_qm9 = np.split(R, split)
-        # Z_qm9 = np.split(Z,split)
+
+        property_names = ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'U0', 'U', 'H', 'G', 'Cv']
         target = {}
-        for name in ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'U0', 'U', 'H', 'G', 'Cv']:
+        for name in property_names:
             target[name] = np.expand_dims(data[name], axis=-1)
-        # y = np.expand_dims([data[name] for name in ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve','U0', 'U', 'H', 'G', 'Cv']], axis=-1)
 
         data_list = []
         for i in tqdm(range(len(N))):
             R_i = torch.tensor(R[i][:N[i], :], dtype=torch.float32)
             z_i = torch.tensor(Z[i][:N[i]], dtype=torch.int64)
 
-            y_i = [torch.tensor(target[name][i], dtype=torch.float32) for name in
-                   ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'U0', 'U', 'H', 'G', 'Cv']]
-            if self.condition is not None:
-                if self.condition == 'gap':
-                    if y_i[4] >= p_threshold:
-                        continue
-                else:
-                    if y_i[1] <= p_threshold:
-                        continue
-            data = Data(pos=R_i, atom_type=z_i, y=y_i[0], mu=y_i[0], alpha=y_i[1], homo=y_i[2],
-                        lumo=y_i[3], gap=y_i[4], r2=y_i[5], zpve=y_i[6], U0=y_i[7], U=y_i[8], H=y_i[9], G=y_i[10],
-                        Cv=y_i[11], num_atoms=torch.tensor(N[i]))
+            y_i = {
+                name: torch.tensor(target[name][i], dtype=torch.float32)
+                for name in property_names
+            }
 
-            data_list.append(data)
+            num_heavy_atoms_i = torch.tensor((z_i != 1).sum().item(), dtype=torch.long)
+
+            data_obj = Data(
+                pos=R_i,
+                atom_type=z_i,
+                mu=y_i['mu'],
+                alpha=y_i['alpha'],
+                homo=y_i['homo'],
+                lumo=y_i['lumo'],
+                gap=y_i['gap'],
+                r2=y_i['r2'],
+                zpve=y_i['zpve'],
+                U0=y_i['U0'],
+                U=y_i['U'],
+                H=y_i['H'],
+                G=y_i['G'],
+                Cv=y_i['Cv'],
+                num_atoms=torch.tensor(N[i], dtype=torch.long),
+                num_heavy_atoms=num_heavy_atoms_i,
+            )
+
+            data_list.append(data_obj)
 
         if self.pre_filter is not None:
             data_list = [data for data in data_list if self.pre_filter(data)]
@@ -149,8 +113,9 @@ class QM93D(InMemoryDataset):
 
     def get_idx_split(self, data_size, train_size, valid_size, seed):
         ids = shuffle(range(data_size), random_state=seed)
-        train_idx, val_idx, test_idx = torch.tensor(ids[:train_size]), torch.tensor(
-            ids[train_size:train_size + valid_size]), torch.tensor(ids[train_size + valid_size:])
+        train_idx = torch.tensor(ids[:train_size])
+        val_idx = torch.tensor(ids[train_size:train_size + valid_size])
+        test_idx = torch.tensor(ids[train_size + valid_size:])
         split_dict = {'train': train_idx, 'valid': val_idx, 'test': test_idx}
         return split_dict
 
@@ -165,14 +130,6 @@ class QM93D(InMemoryDataset):
             raise Exception('Wrong dataset name')
         return sliced_perm
 
-    # def __getitem__(self, idx):
-    #     print(self.data)
-    #     data = self.data[idx].clone()
-    #     if self.transform is not None:
-    #         data = self.transform(data)
-    #     return data
-
-
 class Geom(InMemoryDataset):
     r"""
         Similar to QM93D dataset
@@ -184,7 +141,7 @@ class Geom(InMemoryDataset):
 
         super(Geom, self).__init__(self.folder, transform, pre_transform, pre_filter)
 
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0],weights_only=False )
 
     @property
     def raw_file_names(self):
@@ -1198,3 +1155,8 @@ class PackedConformationDataset(ConformationDataset):
 
     def __len__(self):
         return len(self.new_data)
+
+
+def build_macrolides_dataset(root='./data/macrolides', csv_name='Macrolides.csv', **kwargs):
+    """Convenience wrapper for the Macrocycle-DB Macrolides CSV dataset."""
+    return MacrolidesDataset(root=root, csv_name=csv_name, **kwargs)
